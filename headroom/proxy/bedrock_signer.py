@@ -12,10 +12,12 @@ native SigV4 surface (``docs/bedrock.md``), and it lets ``headroom wrap claude``
 support ``CLAUDE_CODE_USE_BEDROCK=1`` direct-to-AWS — no re-signing gateway
 (LiteLLM / LocalStack) required.
 
-Credentials are resolved once, lazily, via the standard ``boto3`` credential
-chain (env vars, shared config/credentials profile, SSO cache, IMDS, ECS/EKS
-role). The chain is the same one ``aws`` and Claude Code already use, so if
-Claude Code can reach Bedrock without Headroom, the signer can too.
+The credential *provider* is resolved once, lazily, via the standard ``boto3``
+credential chain (env vars, shared config/credentials profile, SSO cache, IMDS,
+ECS/EKS role). The chain is the same one ``aws`` and Claude Code already use, so
+if Claude Code can reach Bedrock without Headroom, the signer can too. Each
+individual signing operation then takes a frozen snapshot of that provider — see
+:meth:`BedrockSigner._frozen_credentials`.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
-    from botocore.credentials import Credentials
+    from botocore.credentials import Credentials, ReadOnlyCredentials
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -58,8 +60,8 @@ class BedrockSigningError(RuntimeError):
 class BedrockSigner:
     """Re-signs Bedrock InvokeModel requests with SigV4 after compression.
 
-    One instance per proxy process. Credentials are resolved on first use and
-    cached; ``botocore``'s credential objects refresh themselves for the
+    One instance per proxy process. The credential provider is resolved on first
+    use and cached; ``botocore``'s credential objects refresh themselves for the
     refreshable sources (SSO, assume-role, IMDS), so a long-lived proxy keeps
     working across credential rotation without re-resolving.
     """
@@ -103,6 +105,27 @@ class BedrockSigner:
         self._credentials = creds
         return creds
 
+    def _frozen_credentials(self) -> ReadOnlyCredentials:
+        """Snapshot the cached provider's credentials for one signing operation.
+
+        ``SigV4Auth`` reads ``access_key``, ``secret_key`` and ``token`` as three
+        separate attribute lookups. On a ``RefreshableCredentials`` provider
+        (SSO, assume-role, IMDS — the long-lived cases this signer exists for)
+        each of those lookups can trigger a refresh, so a rotation landing
+        mid-signature yields a request mixing generations: an old
+        ``X-Amz-Security-Token`` with a new ``Credential`` access key and signing
+        secret. AWS rejects that with 403 ``InvalidSignatureException``, and it
+        is unreproducible after the fact.
+
+        ``get_frozen_credentials()`` takes all three under the provider's
+        refresh lock and returns an immutable ``ReadOnlyCredentials``, which is
+        what botocore's own ``RequestSigner.get_auth_instance`` hands to the auth
+        class. Called per request, so the *next* request still observes freshly
+        refreshed credentials — the caching is of the provider, not of a
+        snapshot.
+        """
+        return self._resolve_credentials().get_frozen_credentials()
+
     def sign(
         self,
         *,
@@ -128,7 +151,10 @@ class BedrockSigner:
         from botocore.auth import SigV4Auth
         from botocore.awsrequest import AWSRequest
 
-        creds = self._resolve_credentials()
+        # One immutable snapshot per signing operation, so all three credential
+        # fields in the signature come from the same generation even if the
+        # provider refreshes concurrently (see _frozen_credentials).
+        frozen = self._frozen_credentials()
 
         # Preserve everything the caller sent except the headers SigV4 will
         # recompute or that describe the stale (pre-compression) body. Keeping
@@ -141,5 +167,5 @@ class BedrockSigner:
         passthrough["host"] = host
 
         aws_request = AWSRequest(method=method, url=url, data=body, headers=passthrough)
-        SigV4Auth(creds, _SERVICE, self._region).add_auth(aws_request)
+        SigV4Auth(frozen, _SERVICE, self._region).add_auth(aws_request)
         return dict(aws_request.headers.items())
